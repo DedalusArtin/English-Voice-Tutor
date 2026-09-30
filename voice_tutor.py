@@ -26,7 +26,7 @@ LM_STUDIO_URL = "http://localhost:1234/v1/chat/completions"
 LM_MODELS_URL = "http://localhost:1234/v1/models"
 MODEL_NAME = ""
 
-WHISPER_MODEL = "base"
+WHISPER_MODEL = "small"   # base=快 / small=准(推荐) / medium=最准但慢
 WHISPER_DEVICE = "cpu"
 WHISPER_COMPUTE = "int8"
 
@@ -132,8 +132,25 @@ def record_and_transcribe():
     
     audio = np.concatenate(frames, axis=0).flatten()
     print("  [ASR] 识别中...")
-    segments, _ = whisper_model.transcribe(audio, beam_size=5, vad_filter=True)
-    return " ".join(seg.text.strip() for seg in segments).strip()
+    segments, info = whisper_model.transcribe(
+        audio,
+        beam_size=10,                          # 更大 beam = 更准
+        vad_filter=True,                       # 过滤非人声
+        vad_parameters=dict(
+            min_silence_duration_ms=500,       # 静音 500ms 才切段
+            speech_pad_ms=200,                 # 前后保留 200ms
+        ),
+        condition_on_previous_text=False,      # 防止复读机循环
+        initial_prompt="Hello, let's practice English together. This is an English conversation.",  # 语境引导
+        no_speech_threshold=0.6,               # 过滤无语音段
+        log_prob_threshold=-1.0,               # 低置信度过滤
+        temperature=[0.0, 0.2, 0.4, 0.6],      # 多轮采样, 失败自动升温度重试
+        compression_ratio_threshold=2.4,        # 防复读
+    )
+    text = " ".join(seg.text.strip() for seg in segments).strip()
+    if info.language:
+        print(f"  [ASR] 检测语言: {info.language} (置信 {info.language_probability:.0%})")
+    return text
 
 # ===================== Web Search =====================
 SEARCH_KEYWORDS = [
@@ -274,21 +291,53 @@ def print_reply(reply):
     print()
 
 # ===================== LM Studio 检测 =====================
-def check_lm_studio():
-    global MODEL_NAME
-    print("  [CHECK] 检查 LM Studio...")
+def fetch_models():
+    """获取 LM Studio 已加载模型列表"""
     try:
         resp = requests.get(LM_MODELS_URL, timeout=5)
-        models = resp.json().get("data", [])
-        if not models:
-            print("  [ERROR] LM Studio 没有加载模型!")
-            return False
-        MODEL_NAME = models[0]["id"]
-        print(f"  [OK] 模型: {MODEL_NAME}")
-        return True
+        return [m["id"] for m in resp.json().get("data", [])]
     except:
-        print("  [ERROR] LM Studio 未启动! 请先: 打开LM Studio → 加载模型 → Start Server")
+        return []
+
+
+def select_model(models, default_idx=0):
+    """让用户选模型, 返回模型名"""
+    if len(models) == 0:
+        return None
+    if len(models) == 1:
+        print(f"  [OK] 模型: {models[0]}")
+        return models[0]
+
+    print("  [OK] 检测到多个模型, 请选择:")
+    print()
+    for i, m in enumerate(models, 1):
+        mark = " (默认)" if i - 1 == default_idx else ""
+        print(f"    [{i}] {m}{mark}")
+    print(f"    [0] 跳过 (用第1个)")
+    print()
+    while True:
+        choice = input(f"  选择模型 (0-{len(models)}): ").strip()
+        if choice == "" or choice == "0":
+            return models[default_idx]
+        if choice.isdigit() and 1 <= int(choice) <= len(models):
+            return models[int(choice) - 1]
+        print("  [!] 无效输入, 重试")
+
+
+def check_lm_studio(auto_select=True):
+    global MODEL_NAME
+    print("  [CHECK] 检查 LM Studio...")
+    models = fetch_models()
+    if not models:
+        print("  [ERROR] LM Studio 没有加载模型!")
+        print("  请: 打开LM Studio → 加载模型 → Start Server (端口1234)")
         return False
+    if auto_select:
+        MODEL_NAME = select_model(models)
+    else:
+        MODEL_NAME = models[0]
+    print(f"  [OK] 当前模型: {MODEL_NAME}")
+    return MODEL_NAME is not None
 
 # ===================== 暂停菜单 =====================
 def pause_menu(current_mode):
@@ -301,8 +350,9 @@ def pause_menu(current_mode):
     print("  [2] 切换到文字模式")
     print("  [3] 切换到语音模式")
     print("  [4] 开/关 语音朗读")
+    print("  [5] 切换 LMS 模型")
     print("  [q] 退出")
-    
+
     choice = input("\n  选择: ").strip().lower()
     if choice == '1' or choice == '':
         return current_mode
@@ -315,13 +365,24 @@ def pause_menu(current_mode):
         TTS_ENABLED = not TTS_ENABLED
         print(f"  语音朗读: {'开' if TTS_ENABLED else '关'}")
         return current_mode
+    elif choice == '5':
+        global MODEL_NAME
+        models = fetch_models()
+        if models:
+            new_model = select_model(models)
+            if new_model:
+                MODEL_NAME = new_model
+                print(f"  \033[92m>> 当前模型: {MODEL_NAME}\033[0m")
+        else:
+            print("  [!] 没有可用模型")
+        return current_mode
     elif choice == 'q':
         return 'Q'
     return current_mode
 
 # ===================== 主流程 =====================
 def main():
-    global TTS_ENABLED
+    global TTS_ENABLED, MODEL_NAME
     print()
     print("=" * 54)
     print("   English Voice Tutor v2.1 - 英语双语对话教师")
@@ -344,6 +405,7 @@ def main():
     print("    /v      切换到语音模式")
     print("    /s      朗读上一条回复")
     print("    /ex     生成3个例句并逐句播放")
+    print("    /model  切换 LMS 模型 (/m)")
     print("    /mute   关闭自动朗读")
     print("    /unmute 开启自动朗读")
     print("    /q      退出")
@@ -385,6 +447,17 @@ def main():
                     continue
                 elif cmd in ['/t', '/text']:
                     print("  \033[92m>> 已在文字模式\033[0m")
+                    continue
+                elif cmd in ['/model', '/m', '/模型']:
+                    # 切换模型
+                    models = fetch_models()
+                    if not models:
+                        print("  [!] 没有可用模型")
+                        continue
+                    new_model = select_model(models)
+                    if new_model:
+                        MODEL_NAME = new_model
+                        print(f"  \033[92m>> 已切换到: {MODEL_NAME}\033[0m")
                     continue
                 elif cmd in ['/speak', '/s', '/读']:
                     # 重读上一条回复
