@@ -1,0 +1,2 @@
+# Batch files must use CRLF — cmd.exe desyncs parsing on LF-only files
+*.bat text eol=crlf
